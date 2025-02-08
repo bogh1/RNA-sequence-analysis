@@ -1,5 +1,6 @@
 # RNA-sequence-analysis
 Overview
+
 This document presents an analysis of RNA sequencing (RNA-Seq) data using bioinformatics tools. The goal is to preprocess, analyze, and interpret gene expression data, identifying differentially expressed genes (DEGs) and potential biological insights.
 
 Key Sections
