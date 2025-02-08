@@ -1,0 +1,839 @@
+---
+title: "rnaseq assign"
+author: "brian"
+date: "2023-11-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries
+
+Packages for use in the assignment
+
+```{R, message=F, warning=F}
+
+library(dplyr) 
+library(biomaRt) 
+library(tximport) 
+library(rhdf5) 
+library(gplots) 
+library(org.Hs.eg.db) 
+library(DESeq2) 
+library(DT) 
+library(apeglm) 
+library(RColorBrewer) 
+library(IHW) 
+library(PCAtools) 
+library(pheatmap) 
+library(clusterProfiler) 
+library(EnhancedVolcano) 
+library(ComplexHeatmap) 
+library(circlize) 
+library(fgsea) 
+library(tidyverse) 
+library(ggpubr) 
+
+```
+
+# Introduction
+
+This R markdown document walks through an RNA-Seq differential expression analysis using `DESeq2` for MA5111. Quality control plots, differential expression results, plots and pathway analysis are covered in the document.
+
+It assumes you have 6 Kallisto quantification directories and a samples.csv file under `/home/data` as well as a .gmt file that we will use for the gene set enrichment analysis.
+
+```{R}
+
+quant_dir <- "/home/rstudio" 
+list.files(quant_dir) 
+
+```
+
+# Reading Input Data
+
+### Metadata
+
+Read in the file `samples.csv` which contains the experimental metadata. Please make sure that the rownames of this dataframe match the kallisto quantification directory names at `/home/rnaseq/quant/`.
+
+```{R}
+
+samples <- read.csv(paste0(quant_dir, "/rnaseq_data.csv"), header=T, row.names = "sample", stringsAsFactors = T) 
+samples 
+
+```
+
+### Convert Numerics to Factors
+
+When performing differential expression analysis using `DESeq2`, if a column in `samples.csv` is numeric and provided to the design formula, `DESeq2` will produce the following message:
+
+> the design formula contains a numeric variable with integer values, specifying a model with increasing fold change for higher values. did you mean for this to be a factor? if so, first convert this variable to a factor using the factor() function
+
+What does this mean? From Mike Love (`DESeq2` author):
+
+> There is a constant fold change for every unit of change in replicates. So if the estimated fold change is 2, this implies that replicates 2 = 2x replicates 1, replicates 3 = 2x replicates 2, etc. Or in other words, the relationship is linear on the log counts scale.
+
+This is not what we want! Be really careful with your metadata file as it defines our statistical model design.
+
+
+The code block below checks the input metadata file, tells the user if any columns are numeric and converts them to a factor.
+
+```{R, message=F, warning=F}
+
+samples$replicate <- factor(samples$replicate) 
+  
+# check its ok: 
+factor_cols <- sapply(samples, is.factor) 
+factor_cols 
+
+```
+
+### Stage Kallisto files
+
+We need to create a file handle object (a named character list) containing the sample IDs and the paths to the kallisto quantification `.h5` files. If the rownames of your metadata object (`samples`) do not match the quantification directory names, you will get an error during the `TXI object` step.
+
+```{R, message=F, warning=F}
+
+files <- file.path(quant_dir, rownames(samples), "abundance.tsv") 
+names(files) <- paste0(rownames(samples)) 
+files 
+
+```
+
+# Tximport
+
+`tximport` imports transcript-level abundances from quantification tools (`kallisto` in our case) and converts them to gene counts for downstream analyses using a differential expression analysis package.
+
+### BiomaRt
+
+We will use `biomaRt` to connect to the `ENSEMBL` databases and map transcript IDs to gene IDs. Firstly, we will create the `mart` object specifying which database to use:
+
+```{R, warning=F, message=F}
+mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl") 
+```
+
+### Transcript to gene (tx2gene)
+
+Recall we used the `ENSEMBL` reference cDNA file `Homo_sapiens.GRCh38.cdna.all.fa.gz` for `Kallisto quant` on LUGH. This means that our quantification files have `ENSEMBL` transcript ID's. We can map them to gene symbols running the code below:
+
+```{R, message=F, warning=F}
+
+tx2gene <- getBM(attributes = c("ensembl_transcript_id_version", "hgnc_symbol"), mart = mart, useCache = FALSE) 
+head(tx2gene) 
+
+```
+
+### TXI object
+
+Create a `txi` object summarising `kallisto` transcipt quantification to the gene-level.
+
+```{R, message=F, warning=F}
+
+txi <- tximport(files, type = "kallisto", tx2gene = tx2gene) 
+head(txi$abundance) 
+
+```
+
+# DESeq2
+
+Now we are ready to create the `DDS` object for `DESeq2` analysis that contains metadata (colData), counts further information that can be obtained via `dds@`.
+
+### Design
+
+The model design is one of the most important steps for an RNA-Seq analysis. Here, we are going to specify the design `~ replicate + condition` (columns of the metadata file). The factor of interest goes last in the model terms, we want to compare control vs. lung vs. melanoma in the experiment. Replicate has been included as we want to control for the effect of sample replicates.
+
+### DDS
+
+We are going to create the `DDS` object using `DESeqDataSetFromTximport()` as we used `tximport` to convert transcript abundances to gene-level counts.
+
+```{R, message=F, warning=F}
+dds <- DESeqDataSetFromTximport(txi, colData = samples, design = ~ replicate + condition ) 
+```
+
+### Factor levels
+
+By default, R will choose a reference level for factors based on alphabetical order. We will explicitly set control as the reference level so you can see how it's done using relevel().
+
+```{R, message=F, warning=F}
+
+dds$condition <- relevel(dds$condition, ref = "control") 
+dds <- DESeq(dds) 
+resultsNames(dds) 
+
+```
+
+# Quality Control
+
+We will use the gene-level counts to perform some quality control checks on the samples in the experiment. We will choose a suitable transformation for the gene counts to reduce impact of lowly-expressed genes on our analysis.
+
+### Extract Counts
+Extract gene-level counts from the `DDS` object.
+
+```{R, message=F, warning=F}
+counts <- counts(dds, normalized=TRUE) 
+```
+
+###Transform Counts
+
+We'll look at two transformations: log2(), and rlog().
+
+```{R, message=F, warning=F}
+
+log2_counts <- assay(normTransform(dds)) 
+rld_counts <- assay(rlog(dds)) 
+
+  
+
+library(vsn) 
+library(hexbin) 
+
+  
+
+## x-axis is the transformed mean not the raw mean.. 
+
+  
+
+log2_plt <- meanSdPlot(log2_counts, ranks=FALSE, plot=FALSE) 
+log2_plt$gg + ggtitle("Log2 + PC Transformation") + xlim(0,20) 
+
+  
+
+rld_plt <- meanSdPlot(rld_counts, ranks=FALSE, plot=FALSE) 
+rld_plt$gg + ggtitle("Rlog Transformation") + xlim(0,20) 
+
+  
+
+```
+
+In both graphs, each gene is represented on the x-axis by its mean count, while the y-axis illustrates the individual count deviation from the mean. A higher sd value signifies greater variation across samples. It is also evident that there is a negative correlation in Log2 + PC transformation graph.This suggests that increased expression is associated with stabilization. To mitigate the impact of skewed data, a log transformation was applied. This transformation not only reduces skewness but also imparts a nearly normal distribution to the data, indicating high data quality.The implementation of a log transformation was necessary as an integral step in quality control to ensure the reliability of the test. The data exhibited numerous peaks characterized by substantial standard deviation, prompting the need for normalization to achieve a more accurate depiction of expression levels.
+
+
+
+### Save Counts
+
+Write the counts files
+
+```{R, message=F, warning=F}
+
+#dir.create("/home/data") 
+
+write.table(counts, "normalised_counts.txt", sep="\t", quote = F) 
+
+write.table(log2_counts, "log2_counts.txt", sep="\t", quote = F) 
+
+```
+
+### Sample Heatmap
+
+A heatmap of sample distances matrix (`dist(t(log2))`) gives us an overview over similarities and dissimilarities between samples.
+
+```{R, message=F, warning=F}
+
+## Calculate distance between samples 
+
+sampleDists <- dist(t(rld_counts)) 
+
+  
+
+## Place distances in matrix 
+
+sampleDistMatrix <- as.matrix(sampleDists) 
+
+  
+
+## Optional, remove colnames 
+
+colnames(sampleDistMatrix) <- NULL 
+
+  
+
+## create annotation dataframe 
+
+ann <- data.frame(Condition = samples$condition) 
+
+  
+
+col <- c("blue", "red1") 
+
+names(col) <- c("control", "tumour") 
+
+ann_col <- list(Condition = col) 
+
+#controls are marked with blue and tumour samples are marked with red 
+
+  
+
+## match annotation rownames to distance mat 
+
+rownames(ann) <- rownames(sampleDistMatrix) 
+
+  
+
+pheatmap(mat=sampleDistMatrix, 
+
+         ## pass distance metric calculated to heatmap 
+
+         clustering_distance_rows=sampleDists, 
+
+         clustering_distance_cols=sampleDists, 
+
+         ## pass annotation dataframe  
+
+         annotation_col = ann, 
+
+         ## add colors 
+
+         annotation_colors = ann_col, 
+
+         ## heatmap colours 
+
+         col=hcl.colors(100,"GnBu",rev=T)) 
+
+```
+
+The heatmap allowed for the viewing of the similaries between the different samples.The tumor samples display a higher degree of similarity among themselves, while the control samples also exhibit a distinct pattern of greater similarity within their group. Notably, the control samples collectively demonstrate a higher level of similarity compared to the tumor samples, as evident from the hierarchical clustering trees on the left side of the heatmap. It is noteworthy that  tumor 1 sample appears closer to the controls than the remaining tumor samples. The other two tumor samples demonstrate a closer relationship to each other, suggesting a potential association with a more advanced or evolved stage.
+
+### PCA
+
+PCA plots the variance explained by samples in each principal component. Typically PC1 & PC2 explain the most variation in the dataset, you should look at these first and foremost.
+
+
+PCA can give you a good idea of how succesful the Differential Expression analysis will be - samples that are very close together in PC feature space will not produce as many DE genes as those that are separated by a large distance.
+
+```{R, message=F,warning=F}
+
+p <- pca(rld_counts, metadata = samples) 
+
+  
+
+biplot(p, 
+
+       colby = 'condition', 
+
+       colkey = c('control'='royalblue', 'tumour'='red1'), 
+
+       hline = 0, 
+
+       vline = 0, 
+
+       legendPosition = 'right', 
+
+       legendLabSize = 12, 
+
+       legendIconSize = 8.0, 
+
+       title = 'PCA bi-plot', 
+
+       subtitle = 'PC1 versus PC2') 
+
+```
+
+This PCA plot is used to visualize and analyze the multivariate relationships among variables in a dataset.From viewing this plot it can be noted how similar the control samples are to each other.Tumour is seen to be the closest sample to the control.This again may suggest that tumour sample 2 and 3 are more developed.
+# Differential Expression Analysis
+
+### DESeq results()
+
+We can extract differentially expressed genes between phenotypes of interest by using `results()` on the `DDS` object. We will apply the `apeglm` shrinkage estimator on our results. apeglm shrinks low confidence (high inter-sample variation) differentially expressed genes towards 0, producing a robust set of differentially expressed genes.
+
+The argument `coef` in `lfcShrink` refers to the contrast of interest returned by `resultsNames(dds)`. For lung vs. control, it is the 4th character string returned thus `coef=4` for lung vs. control.
+
+##### Set up tumour vs control:
+
+```{R, message=F, warning=F}
+
+tumour_v_control <- results(dds, filterFun=ihw, alpha=0.05, c("condition", "tumour", "control")) #results() performs differential expression analysis, alpha sets the significance threshold to control the false discovery rate (FDR) at 5%. 
+
+res1 <- lfcShrink(dds=dds, res=tumour_v_control, coef=4, type="apeglm") 
+
+summary(res1) 
+
+```
+It can be seen that there was 269 genes upregulated and there was 199 downregulated genes.
+
+### Resusable Functions
+Below are some handy functions for extracting differentially expressed genes and performing annotation of DE genes.
+
+##### Extract Up Regulated Genes
+
+```{R}
+
+get_upregulated <- function(df){ 
+
+key <- intersect(rownames(df)[which(df$log2FoldChange>=1)], rownames(df)[which(df$pvalue<=0.05)]) 
+  results <- as.data.frame((df)[which(rownames(df) %in% key),]) 
+return(results) 
+} 
+
+```
+
+##### Extract Down Regulated genes
+
+```{R}
+
+get_downregulated <- function(df){ 
+  	key <- intersect(rownames(df)[which(df$log2FoldChange<=-1)], rownames(df)[which(df$pvalue<=0.05)]) 
+  	results <- as.data.frame((df)[which(rownames(df) %in% key),]) 
+  	return(results) 
+} 
+
+```
+
+##### Annotate DE genes
+
+```{R}
+
+annotate_de_genes <- function(df){ 
+  
+
+    df$hgnc_symbol <- rownames(df) 
+    mart <- useMart(biomart = "ensembl", dataset = "hsapiens_gene_ensembl") 
+    info <- getBM(attributes=c("hgnc_symbol", 
+
+                               "ensembl_gene_id_version", 
+
+                               "chromosome_name", 
+
+                               "start_position", 
+
+                               "end_position", 
+
+                               "strand", 
+
+                               "entrezgene_description"), 
+
+                  filters = c("hgnc_symbol"), 
+
+                  values = df$hgnc_symbol, 
+
+                  mart = mart, 
+
+                  useCache=FALSE) 
+
+  
+
+    tmp <- merge(df, info, by="hgnc_symbol") 
+
+    tmp$strand <- gsub("-1", "-", tmp$strand) 
+
+    tmp$strand <- gsub("1", "+", tmp$strand) 
+
+    tmp$hgnc_symbol <- make.names(tmp$hgnc_symbol, unique = T) 
+
+    tmp <- tmp[!grepl("CHR", tmp$chromosome_name),] 
+
+  
+
+    output_col <- c("Gene", "Ensembl ID", "Chromosome", "Start", "Stop", "Strand", "Description", "Log2FC", "P-value", "Adj P-value") 
+
+    tmp <- subset(tmp, select=c(hgnc_symbol, ensembl_gene_id_version, chromosome_name, start_position, end_position, strand, entrezgene_description, log2FoldChange, pvalue, padj)) 
+
+    colnames(tmp) <- output_col 
+
+  
+
+    if(min(tmp$Log2FC) > 0){ 
+
+        tmp <- tmp[order(-tmp$Log2FC),] 
+
+    }else{ 
+
+        tmp <- tmp[order(tmp$Log2FC),] 
+
+    } 
+
+  
+
+    return(tmp) 
+
+  
+
+} 
+
+```
+
+### Write DE results
+
+Use the above functions to extract up/down regulated genes and annotate them using biomaRt, and write to a file. Please note that the get\_(up/down)regulated function requires a dataframe as input.
+
+> Note: we will focus on lung vs control for the remainder of the practical
+
+```{R, message=F, warning=F}
+
+de_up <- get_upregulated(as.data.frame(res1)) 
+de_down <- get_downregulated(as.data.frame(res1)) 
+upregulated_genes <- annotate_de_genes(de_up) 
+downregulated_genes <- annotate_de_genes(de_down) 
+
+
+#confirm these worked 
+
+head(upregulated_genes) 
+
+```
+
+# Results Plots
+
+### Volcano Plot
+
+Volcano plots are useful to show how many genes are differentially expressed in the experimental contrast of interest. Labels are optional, I have included them so you know how to use them.
+
+> N.B Volcano plots use -log10 on the Y-axis.
+
+```{R, message=F, warning=F}
+
+## remove NA values from results 
+
+res1 <- na.omit(res1) 
+
+  
+## calculate min/max axis values for plot (optional) 
+
+min_width <- min(res1$log2FoldChange) 
+max_width <- max(res1$log2FoldChange) 
+max_height <- -log10(min(res1[res1$pvalue>0, 5])) 
+
+
+## Grab top 10 up-reg genes for plot 
+
+up <- subset(res1, res1$log2FoldChange > 1 & res1$pvalue <= 0.05) 
+up <- up[order(-up$log2FoldChange),] 
+up_list <- head(rownames(up), n=10L) 
+
+
+## Grab top 10 down-reg genes for plot 
+
+down <- subset(res1, res1$log2FoldChange < -1 & res1$pvalue <= 0.05) 
+down <- down[order(down$log2FoldChange),] 
+down_list <- head(rownames(down), n=10L) 
+
+  
+
+## place top 20 DE genes in vector (optinal...) 
+
+plot_top_20 <- c(up_list, down_list) 
+
+  
+
+EnhancedVolcano(res1, 
+
+                lab=rownames(res1), 
+
+                x="log2FoldChange", 
+
+                y="pvalue", 
+
+                selectLab=plot_top_20, 
+
+                drawConnectors=TRUE, 
+
+                legendPosition = "none", 
+
+                FCcutoff=1.0, 
+
+                pCutoff=0.05, 
+
+                title="Volcano Plot", 
+
+                subtitle="Tumour vs. Control", 
+
+                caption= paste0('Total Genes = ', nrow(res1)), 
+
+                xlim=c(min_width, max_width), 
+
+                ylim=c(0, max_height)) 
+
+```
+
+The volcano plot visually represents differentially expressed genes by plotting the logarithm of fold change against the corresponding p-values. In this instance, we have highlighted the top 20 genes exhibiting the most significant differential expression. Among these, 11 are upregulated and 9 are downregulated, each denoted by distinct colors.Genes located at the center of the volcano plot exhibit log2 fold changes close to zero, indicating minimal variation between the specified conditions. Consequently, these genes are considered non-differentially expressed. 
+
+### Bonus: apeglm visualised
+Make a volcano plot of `tumour_v_ctrl`, the `DESeq2` results object that has not been filtered by `apeglm`.
+
+You can see that there are genes with very large log2 FC values. As a rule of thumb, be skeptical of genes that have LFC values over +/- 10.
+
+```{R, message=F, warning=F}
+
+res1 <- na.omit(tumour_v_control) 
+
+
+min_width <- min(res1$log2FoldChange) 
+max_width <- max(res1$log2FoldChange) 
+max_height <- -log10(min(res1[res1$pvalue>0, 5])) 
+
+  
+up <- subset(res1, res1$log2FoldChange > 1 & res1$pvalue <= 0.05) 
+up <- up[order(-up$log2FoldChange),] 
+up_list <- head(rownames(up), n=10L) 
+
+  
+
+down <- subset(res1, res1$log2FoldChange < -1 & res1$pvalue <= 0.05) 
+down <- down[order(down$log2FoldChange),] 
+down_list <- head(rownames(down), n=10L) 
+
+  
+
+plot_top_20 <- c(up_list, down_list) 
+EnhancedVolcano(res1, 
+
+          lab=rownames(res1), 
+
+          			x="log2FoldChange", 
+
+          			y="pvalue", 
+
+          			selectLab=plot_top_20, 
+
+          			drawConnectors=TRUE, 
+
+          			FCcutoff=1.0, 
+
+          			pCutoff=0.05, 
+
+          			title="Volcano Plot", 
+
+          			subtitle="Tumour vs. Control", 
+
+          			legendLabSize=8, 
+
+          			caption = paste0('Total Genes = ', nrow(res1))) 
+
+  
+
+##reset res1 for heatmaps 
+
+res1 <- na.omit(res1) 
+
+```
+Apeglm is a statistical method used in the analysis of differential gene expression, particularly in RNA-seq data. It stands for adaptive permutation-based differential expression analysis for RNA-seq data using a zero-inflated Gaussian mixture model. Unlike the prior volcano plot it hasnt been used to filter the plot.As a result it gives more values which are less accurate.
+### Heatmap
+
+Heatmaps are another way to show the differentially expressed genes in the experimental contrast of interest.
+
+```{R, message=F, warning=F}
+
+# subset the counts matrix to get the Tumour and control samples 
+
+subset <- rld_counts[, 1:6] 
+
+  
+
+# now select de_up, de_down, i.e DE genes that passed the filtering our function produced 
+
+up <- rownames(de_up) 
+
+down <- rownames(de_down) 
+
+  
+
+# subset matrix to include only DE genes 
+
+key <- c(up, down) 
+
+subset <- subset[which(rownames(subset) %in% key),] 
+
+  
+
+# scale and center the values 
+
+mat <- as.matrix(scale(t(subset), center = T)) 
+
+  
+
+# basic plot to check we're plotting something sensible 
+
+#pheatmap(t(mat)) 
+
+  
+
+# spruce it up a bit.. 
+
+ann <- data.frame(Condition = c(rep("Control", 3), rep("Tumour", 3))) 
+
+rownames(ann) <- rownames(mat) 
+
+col <- c("blue", "red") 
+
+names(col) <- c("Control", "Tumour") 
+
+ann_col <- list(Condition = col) 
+
+  
+
+pheatmap(t(mat),  
+
+         show_rownames = TRUE, 
+
+         annotation_col = ann, 
+
+         annotation_colors = ann_col, 
+
+         color = hcl.colors(100, "PRGn",rev=F)) 
+
+```
+This heatmap represent the gene expression of the upregulated and down regulated genes.The highly upregulated genes are dark green whereas the highly downregulated genes are dark purple.the genes can be categorized into two primary groups: one exhibiting upregulation in controls and downregulation in tumors from IL18BP to HMGCS, and the other showing the opposite trend, with downregulation in controls and upregulation in tumors from PTPRZ1 to LGI4.The heatmap highlights regions of substantial differential regulation across samples. For instance, genes spanning from PTPRZ1 to UBD display significant upregulation in Tumor 3, while exhibiting minimal differential expression in Tumor 1. 
+
+
+# Pathway Analysis
+
+## fgsea
+
+We will use the GO Biological processes GMT file c5.bp.v7.0.symbols.gmt which should be in the quant directory.
+
+### Create ranked gene list
+
+Extract the gene names and associated log2FoldChanges from our tumour vs control study to generate a ranked gene list.
+
+```{r, message=F, warning=F}
+
+## convert result object to dataframe 
+
+res <- as.data.frame(res1) # lung vs control 
+
+res$hgnc_symbol <- rownames(res) 
+
+  
+
+# compute summary stat 
+
+fgsea_rank <- res %>% 
+
+              dplyr::select(hgnc_symbol, log2FoldChange) %>% 
+
+              na.omit() %>% 
+
+              distinct() %>% 
+
+              group_by(hgnc_symbol) %>% 
+
+              summarize(stat=mean(log2FoldChange)) 
+
+  
+
+fgsea_rank 
+
+```
+Genes here are arranged in descending order accompanied by their respective log2FoldChange values. A higher positive average log2FoldChange denotes a more pronounced upregulation in tumors, while a lower negative average log2FoldChange signifies a stronger downregulation. Among the top genes listed, A2ML1 stands out with the highest positive log2FoldChange (2.34), showing it is the most prominently upregulated gene.A3GALT2 holds the distinction of having the lowest negative log2FoldChange (-0.00358), signifying it as the most downregulated gene in the list.
+### Convert to a named list
+
+```{R,message=F, warning=F}
+
+# create named list 
+
+rank <- deframe(fgsea_rank) 
+
+head(rank, 20) 
+
+```
+
+### Read GMT file
+
+```{R, message=F, warning=F}
+
+# read in gmt file 
+
+pathway <- gmtPathways("/home/rstudio/c6.all.v2023.2.Hs.symbols.gmt") 
+
+head(pathway, 1) 
+
+```
+
+### Run fgsea
+
+```{R, message=F, warning=F}
+
+# run fgsea 
+
+fgsea <- fgsea(pathways=pathway, stats=rank, nperm=1000) 
+
+  
+
+fgseaResTidy <- fgsea %>% 
+
+  as_tibble() %>% 
+
+  arrange(desc(NES)) 
+
+  
+
+# Show in a nice table: 
+
+fgseaResTidy %>% 
+
+  dplyr::select(-leadingEdge, -ES, -nMoreExtreme) %>% 
+
+  arrange(padj) %>% 
+
+  DT::datatable() 
+
+```
+
+### Enrichment plots
+
+Here, you can see examples of pathways enriched in our tumour samples, and pathways enriched in Control (i.e negative NES score)
+
+```{R, message=F, warning=F}
+
+filtered_pathway <- subset(fgsea, NES > 1.3) 
+
+filtered_pathway 
+
+  
+
+filt_up <- as.vector(filtered_pathway$pathway) 
+
+  
+
+for (i in filt_up){ 
+
+    plt <- plotEnrichment(pathway = pathway[[i]], 
+
+    gseaParam = 1, ticksSize = 0.5, stats= rank) + 
+
+    labs(title=i) + theme(plot.title = element_text(hjust = 0.5, face="bold")) 
+
+    print(plt) 
+
+} 
+
+  
+
+filtered_pathway <- subset(fgsea, NES < -1.3) 
+
+filtered_pathway 
+
+  
+
+filt_down <- as.vector(filtered_pathway$pathway) 
+
+  
+
+for (i in filt_down){ 
+
+    plt <- plotEnrichment(pathway = pathway[[i]], 
+
+    gseaParam = 1, ticksSize = 0.5, stats= rank) + 
+
+    labs(title=i) + theme(plot.title = element_text(hjust = 0.5, face="bold")) 
+
+    print(plt) 
+
+} 
+
+```
+Top differentially expressed genes to known cancer biology
+
+HINATA_NFKB_IMMU_INF:This gene set was recognised as the most differentially expressed. It is identified by the systematic name M2645, focuses on immune and inflammatory genes induced by NF-kappaB in primary keratinocytes and fibroblasts. NF-kappaB is a pivotal regulator in both normal and pathological processes, playing a context-dependent role in neoplasia. In skin, its involvement in epidermal homeostasis and the development of squamous cell carcinoma is well-established.(Hinata,K, 2003) While NF-kappaB induces proinflammatory and antiapoptotic genes in both settings, it exhibits divergent effects on growth regulatory genes. Specifically, in keratinocytes, NF-kappaB induces p21(CIP1), inhibiting the growth of both cell types. Conversely, the growth inhibitory factor (GIF) is increased by NF-kappaB in both settings but inhibits growth only in keratinocytes. These findings underscore the tissue-selective programming ability of transcription factors like NF-kappaB, driven by both differential target gene induction and the induction of common targets with varying effects based on cellular lineage.
+
+CSR_LATE_UP.V1_UP:This gene set is linked to tumours in fibroblasts. Study have shown thatn genes in this set are invovled in  cancer progression and wound healing, revealing a stereotyped gene expression program in fibroblasts exposed to serum that mirrors their role in wound healing. The identified fibroblast common serum response is consistently regulated in various human tumors, suggesting its relevance. Genes induced in this set are expressed by tumor cells and tumor-associated fibroblasts. A wound-like phenotype, present early in cancer, persists during treatment and predicts increased metastasis and death risk in breast, lung, and gastric carcinomas. The transcriptional signature of fibroblast response to serum emerges as a potential link between cancer and wound healing, offering a robust predictor of clinical outcomes in several common cancers.(Chang, H. Y.,2004)
+
+KRAS.AMP.LUNG_UP.V1_DN:This gene set is genes that are downregulated and are linked to lung cancer. Lung cancer is a leading global cause of cancer-related deaths, often asymptomatic in early stages. The Kirsten rat sarcoma virus oncogene homolog (KRAS) is frequently mutated in non-small cell lung cancer, impacting patient survival. This information is crucial for tailored treatment, considering rapid pharmaceutical advancements. Single nucleotide polymorphisms altering let-7 micro-RNA influence cancer susceptibility. Gefitinib is used to target KRAS but it faces resistance due to direct interaction with phosphoinositide3-kinase. Atorvastatin may overcome gefitinib resistance. Focal adhesion kinase inhibitors and Heat Shock protein90 inhibition show promise against KRAS-related cancers. Phosphoinositide 3-kinase pathway inhibition and programmed cell death ligand1 blocking offer therapeutic avenues, despite challenges posed by KRAS's complex nature. Ongoing research, including inhibitors, immunotherapy, and combinations, holds promise for overcoming this challenging disease.(Ghosh, S, 2023)
+
+
+
+Ghosh, S., Bhuniya, T., Dey, A., Koley, M., Roy, P., Bera, A., Gol, D., Chowdhury, A., Chowdhury, R., & Sen, S. (2023). An Updated Review on KRAS Mutation in Lung Cancer (NSCLC) and Its Effects on Human Health. Applied biochemistry and biotechnology, 10.1007/s12010-023-04748-8. Advance online publication. 
+
+Chang, H. Y., Sneddon, J. B., Alizadeh, A. A., Sood, R., West, R. B., Montgomery, K., Chi, J. T., van de Rijn, M., Botstein, D., & Brown, P. O. (2004). Gene expression signature of fibroblast serum response predicts human cancer progression: similarities between tumors and wounds. PLoS biology, 2(2), E7. 
+
+Hinata, K., Gervin, A. M., Jennifer Zhang, Y., & Khavari, P. A. (2003). Divergent gene regulation and growth effects by NF-kappa B in epithelial and mesenchymal cells of human skin. Oncogene, 22(13), 1955–1964. 
